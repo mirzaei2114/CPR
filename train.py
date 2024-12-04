@@ -7,7 +7,7 @@ import sys
 import torch
 
 from loguru import logger
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, ConcatDataset
 from torch.utils.tensorboard.writer import SummaryWriter
 from tqdm import tqdm, trange
 import torch.nn as nn
@@ -104,30 +104,32 @@ def main(args):
     assert all([sub_category in all_categories for sub_category in sub_categories]), f"{sub_categories} must all be in {all_categories}"
     model_info = MODEL_INFOS[args.pretrained_model]
     layers = [model_info['layers'][model_info['scales'].index(scale)] for scale in args.scales]
+    datasets = []
     for sub_category in sub_categories:
-        logger_handler_id = logger.add(os.path.join(args.log_path, sub_category, 'runtime.log'), mode='w')
-        seed_worker       = fix_seeds(66)
-        model             = create_model(args.pretrained_model, layers).cuda().train()
-        dataset           = CPRDataset(args.dataset_name, sub_category, args.resize, args.data_dir, args.scales, args.region_sizes, args.retrieval_dir, args.foreground_dir)
-        writer            = SummaryWriter(os.path.join(args.log_path, sub_category), flush_secs=10)
-        dataloader        = DataLoader(dataset, batch_size=args.batch_size, sampler=InfiniteSampler(dataset), num_workers=args.num_workers, pin_memory=True, worker_init_fn=seed_worker)
-        optimizer         = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=1e-2)
-        loss_fn           = ContrastiveLoss(exponent=3).cuda()
-        dataloader_iter   = iter(dataloader)
-        for global_step in trange(1, args.steps+1, leave=False, desc=f'{sub_category} train'):
-            batch  = [x.cuda() for x in next(dataloader_iter)]
-            loss_d = train_one_step(model, batch, loss_fn)
-            optimizer.zero_grad()
-            loss_d['loss'].backward()
-            optimizer.step()
-            [writer.add_scalar(f"train/{k}", v.item(), global_step) for k, v in loss_d.items()]
-            if global_step % args.test_per_steps == 0 or global_step == args.steps: 
-                ret = test(model, dataset.train_fns, dataset.test_fns, dataset.retrieval_result, dataset.foreground_result, args.resize, args.region_sizes, dataset.root_dir, args.k_nearest, args.T)
-                torch.save(model.state_dict(), os.path.join(args.log_path, sub_category, f'{global_step:05d}.pth'))
-                logger.info(f'[{global_step}] {sub_category} test result: {" ".join([f"{k}: {v:.4f}" for k, v in ret.items()])}')
-                [writer.add_scalar(f"test/{k}", v, global_step) for k, v in ret.items()]
-                model.train()
-        logger.remove(logger_handler_id)
+        datasets.append(CPRDataset(args.dataset_name, sub_category, args.resize, args.data_dir, args.scales, args.region_sizes, args.retrieval_dir, args.foreground_dir))
+    dataset           = ConcatDataset(datasets)
+    logger_handler_id = logger.add(os.path.join(args.log_path, 'runtime.log'), mode='w')
+    seed_worker       = fix_seeds(66)
+    model             = create_model(args.pretrained_model, layers).cuda().train()
+    writer            = SummaryWriter(os.path.join(args.log_path), flush_secs=10)
+    dataloader        = DataLoader(dataset, batch_size=args.batch_size, sampler=InfiniteSampler(dataset), num_workers=args.num_workers, pin_memory=True, worker_init_fn=seed_worker)
+    optimizer         = torch.optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=1e-2)
+    loss_fn           = ContrastiveLoss(exponent=3).cuda()
+    dataloader_iter   = iter(dataloader)
+    for global_step in trange(1, args.steps+1, leave=False, desc=f'train'):
+        batch  = [x.cuda() for x in next(dataloader_iter)]
+        loss_d = train_one_step(model, batch, loss_fn)
+        optimizer.zero_grad()
+        loss_d['loss'].backward()
+        optimizer.step()
+        [writer.add_scalar(f"train/{k}", v.item(), global_step) for k, v in loss_d.items()]
+        if global_step % args.test_per_steps == 0 or global_step == args.steps: 
+            ret = test(model, dataset.train_fns, dataset.test_fns, dataset.retrieval_result, dataset.foreground_result, args.resize, args.region_sizes, dataset.root_dir, args.k_nearest, args.T)
+            torch.save(model.state_dict(), os.path.join(args.log_path, f'{global_step:05d}.pth'))
+            logger.info(f'[{global_step}] test result: {" ".join([f"{k}: {v:.4f}" for k, v in ret.items()])}')
+            [writer.add_scalar(f"test/{k}", v, global_step) for k, v in ret.items()]
+            model.train()
+    logger.remove(logger_handler_id)
 
 if __name__ == "__main__":
     parser = get_args_parser()
